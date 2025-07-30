@@ -58,8 +58,9 @@ get_max_date <- function(dbconn, start_date)
     return (tmp_df)
 }
 
-get_return <- function(dbconn, start_date, end_date)
+get_return <- function(dbconn, sec_id, start_date, end_date)
 {
+    if (missing(sec_id)) sec_id <- NULL
     if (missing(start_date)) start_date <- as.Date("1970-01-01")
     if (missing(end_date)) end_date <- as.Date("2100-01-01")
 
@@ -68,6 +69,12 @@ get_return <- function(dbconn, start_date, end_date)
 
     tmp_sql <- "SELECT * FROM sec_return
                 WHERE [Date] >= ? AND [Date] <= ?"
+
+    if (length(sec_id) > 0) {
+        tmp_param_id <- str_flatten_comma(sec_id)
+        tmp_sql <- paste(tmp_sql, "AND sec_id IN (", tmp_param_id, ")")
+    }
+
     tmp_sql <- str_replace_all(tmp_sql, "\\s+", " ")
 
     tmp_params <- as.list(c(tmp_start_date, tmp_end_date))
@@ -78,18 +85,34 @@ get_return <- function(dbconn, start_date, end_date)
     return (tmp_df)
 }
 
-get_last_price <- function(dbconn)
+get_last_price <- function(dbconn, sec_id)
 {
+    if (missing(sec_id)) sec_id <- NULL
+
     tmp_sql <- "SELECT * FROM last_price"
+
+    if (length(sec_id) > 0) {
+        tmp_param_id <- str_flatten_comma(sec_id)
+        tmp_sql <- paste(tmp_sql, "WHERE sec_id IN (", tmp_param_id, ")")
+    }
+
     tmp_df <- dbGetQuery(dbconn, tmp_sql)
     tmp_df$Date <- as.Date.POSIXct(tmp_df$Date)
 
     return (tmp_df)
 }
 
-get_last_volume <- function(dbconn)
+get_last_volume <- function(dbconn, sec_id)
 {
+    if (missing(sec_id)) sec_id <- NULL
+
     tmp_sql <- "SELECT * FROM last_volume"
+
+    if (length(sec_id) > 0) {
+        tmp_param_id <- str_flatten_comma(sec_id)
+        tmp_sql <- paste(tmp_sql, "WHERE sec_id IN (", tmp_param_id, ")")
+    }
+
     tmp_df <- dbGetQuery(dbconn, tmp_sql)
     tmp_df$Date <- as.Date.POSIXct(tmp_df$Date)
 
@@ -111,14 +134,22 @@ qdb_table_update <- function(dbconn, tmp_dfData, table_name, keys)
     rc <- table_update(dbconn, target_tbl, source_tbl)
 }
 
-qdb_sec_price_update <- function(dbconn)
+qdb_sec_price_update <- function(dbconn, sec_id)
 {
+    if (missing(sec_id)) sec_id <- NULL
+
     tmp_var_price <- c("open", "high", "low", "close", "adj_close")
     tmp_var_volume <- c("volume")
 
-    tmp_dfPV_chg <- get_return(dbconn)
-    tmp_dfP_last <- get_last_price(dbconn)
-    tmp_dfV_last <- get_last_volume(dbconn)
+    if (length(sec_id) > 0) {
+        tmp_dfPV_chg <- get_return(dbconn, sec_id)
+        tmp_dfP_last <- get_last_price(dbconn, sec_id)
+        tmp_dfV_last <- get_last_volume(dbconn, sec_id)
+    } else {
+        tmp_dfPV_chg <- get_return(dbconn)
+        tmp_dfP_last <- get_last_price(dbconn)
+        tmp_dfV_last <- get_last_volume(dbconn)
+    }
 
     tmp_dfPV <- tmp_dfPV_chg %>%
         left_join(tmp_dfP_last, by=c("sec_id", "Date"), suffix=c("", "_last")) %>%
@@ -141,16 +172,21 @@ qdb_sec_price_update <- function(dbconn)
         select(sec_id, Date, any_of(tmp_var_price), any_of(tmp_var_volume)) %>%
         arrange(sec_id, Date)
 
+    if (nrow(tmp_dfPV) == 0) {
+        cat(sprintf("\tNo derived Price/Volume for {%s}\n", sec_id))
+        return (-1)
+    }
+
     keys <- c("sec_id")
     table_name <- "sec_price"
     qdb_table_update(dbconn, tmp_dfPV, table_name, keys)
+
+    return (0)
 }
 
 #qMain <- function(chrFileParam, dtStart, dtEnd)
 qMain <- function()
 {
-    # extended_types=TRUE to handle Date/POSIX in R automatically
-#    dbconn <<- dbConnect(RSQLite::SQLite(), "", flags=SQLITE_RW, extended_types=TRUE)
     dbconn <<- dbConnect(RSQLite::SQLite(), "", flags=SQLITE_RW)
 
     on.exit(
@@ -194,14 +230,14 @@ qMain <- function()
     # get last date for each stock return
     tmp_dfMaxDate <- get_max_date(dbconn, tmp_start_date_default)
 
+#    k1 <- c(1:20, 260, 400)
+#    n <- length(k1)
+#    for (i in k1) {
+
     tmp_df_all <- NULL
 
-    k1 <- c(1:20, 260, 400)
-    n <- length(k1)
-
-#    n <- nrow(tmp_dfMaxDate)
-#    for (i in 1:n) {
-    for (i in k1) {
+    n <- nrow(tmp_dfMaxDate)
+    for (i in 1:n) {
         if (i %% 100 < 1) cat(sprintf("\t%.2f pct completed.\n", 100*i/n))
         tmp_sec_id <- tmp_dfMaxDate$sec_id[i]
         tmp_id_yahoo <- tmp_dfMaxDate$id_yahoo[i]
@@ -320,11 +356,9 @@ qMain <- function()
 
 }
 
-testDebug <- function()
-{
-    print("")
-}
-
+###########
+# NOT USED
+###########
 get_last_date <- function(dbconn)
 {
     tmp_sql <- "SELECT a1.sec_id,
