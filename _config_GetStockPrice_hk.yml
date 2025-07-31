@@ -1,0 +1,6 @@
+default:
+  default_date: 1999-12-31
+  file_stock_list: "HK.xlsx"
+  file_db:
+  - hk_stock_return.db
+  - hk_stock_price.db
