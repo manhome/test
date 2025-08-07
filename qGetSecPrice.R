@@ -30,11 +30,8 @@ pct_chg <- function(x) {
     return (y)
 }
 
-get_max_date <- function(dbconn, start_date)
+get_max_date <- function(dbconn)
 {
-    if (missing(start_date)) start_date <- Sys.Date()
-    tmp_start_date <- as.numeric(as.POSIXct(start_date, tz="UTC"))
-
     tmp_sql <- "SELECT s1.sec_id, s1.id_yahoo, 
                 IFNULL(
                     (SELECT MAX(a1.Date) FROM sec_return a1
@@ -42,18 +39,15 @@ get_max_date <- function(dbconn, start_date)
                         AND a1.volume != 0
                         AND a1.Date < (SELECT MAX(a2.Date) FROM sec_return a2
                             WHERE a2.sec_id = a1.sec_id
-                            AND a2.volume != 0
-                            AND a2.Date < ?)), ?) AS [Date]
+                            AND a2.volume != 0)), 0) AS [Date]
             FROM securities s1
             ORDER BY [sec_id]"
-
+    
     tmp_sql <- str_replace_all(tmp_sql, "\\s+", " ")
-
-    tmp_params <- as.list(rep(tmp_start_date, 2))
-
-    tmp_df <- dbGetQuery(dbconn, tmp_sql, params=tmp_params)
+    
+    tmp_df <- dbGetQuery(dbconn, tmp_sql)
     tmp_df$Date <- as.Date.POSIXct(tmp_df$Date)
-
+    
     return (tmp_df)
 }
 
@@ -132,12 +126,11 @@ get_last_volume <- function(dbconn, sec_id)
 get_sec_id <- function(dbconn)
 {
     tmp_sql <- "SELECT sec_id FROM last_price t1
-        WHERE t1.Date > (SELECT MAX(t2.Date) FROM sec_price t2 
-            WHERE t2.sec_id = t1.sec_id)
-        UNION SELECT sec_id 
-        FROM last_volume t1
-        WHERE t1.Date > (SELECT MAX(t2.Date) FROM sec_price t2 
-            WHERE t2.sec_id = t1.sec_id AND t2.volume > 0)"
+        WHERE t1.Date > IFNULL((SELECT MAX(t2.Date) FROM sec_price t2 
+            WHERE t2.sec_id = t1.sec_id), 0)
+        UNION SELECT sec_id FROM last_volume t1
+        WHERE t1.Date > IFNULL((SELECT MAX(t2.Date) FROM sec_price t2 
+            WHERE t2.sec_id = t1.sec_id AND t2.volume > 0), 0)"
 
     tmp_df <- dbGetQuery(dbconn, tmp_sql)
 
@@ -252,22 +245,28 @@ qMain <- function(file_config, dtStart, dtEnd)
     qdb_table_update(dbconn, tmp_dfSecs, table_name, keys)
 
     # get last date for each stock return
-    tmp_dfMaxDate <- get_max_date(dbconn, tmp_start_date_default)
+    tmp_dfMaxDate <- get_max_date(dbconn)
 
     tmp_df_all <- NULL
 
-#    k1 <- c(1:20, 602, 846)
-#    n <- length(k1)
-#    for (i in k1) {
     n <- nrow(tmp_dfMaxDate)
     for (i in 1:n) {
         if (i %% 100 < 1) cat(sprintf("\t%.2f pct completed.\n", 100*i/n))
         tmp_sec_id <- tmp_dfMaxDate$sec_id[i]
         tmp_id_yahoo <- tmp_dfMaxDate$id_yahoo[i]
-        tmp_start_date <- format(max(c(tmp_dfMaxDate$Date[i], dtStart), na.rm=TRUE), "%Y-%m-%d")
-        tmp_end_date <- format(min(c(Sys.Date(), dtEnd), na.rm=TRUE), "%Y-%m-%d")
+        if (dtStart == as.Date("1970-01-01")) {
+            tmp_start_date <- format(max(c(tmp_dfMaxDate$Date[i], tmp_start_date_default), na.rm=TRUE), "%Y-%m-%d")
+        } else if (dtStart > as.Date("1970-01-01")) {
+            tmp_start_date <- format(dtStart, "%Y-%m-%d")
+        } # if
 
-        cat(sprintf("\tProcess %s\n", tmp_id_yahoo))
+        if (dtEnd < Sys.Date()) {
+            tmp_end_date <- format(dtEnd, "%Y-%m-%d")
+        } else {
+            tmp_end_date <- format(min(c(Sys.Date(), dtEnd), na.rm=TRUE), "%Y-%m-%d")
+        } # if
+
+        cat(sprintf("\tGet Price %s from %s to %s\n", tmp_id_yahoo, tmp_start_date, tmp_end_date))
         tmp_df <- tq_get(tmp_id_yahoo, from=tmp_start_date, to=tmp_end_date)
         if (is.data.frame(tmp_df) && (nrow(tmp_df) > 0)) {
             tmp_df_all <- bind_rows(tmp_df_all, tmp_df)
@@ -290,8 +289,8 @@ qMain <- function(file_config, dtStart, dtEnd)
         tmp_start_date <- tmp_df$start_date[i]
         tmp_end_date <- tmp_df$end_date[i]
         tmp_dates <- seq.Date(from=tmp_start_date, to=tmp_end_date, by=1)
-        tmp_df <- data.frame(symbol=tmp_symbol, date=tmp_dates, stringsAsFactors=FALSE)
-        tmp_df_dates <- bind_rows(tmp_df_dates, tmp_df)
+        tmp_df_1 <- data.frame(symbol=tmp_symbol, date=tmp_dates, stringsAsFactors=FALSE)
+        tmp_df_dates <- bind_rows(tmp_df_dates, tmp_df_1)
     } # for (i
 
     tmp_dfData <- tmp_df_all %>%
@@ -388,15 +387,19 @@ qMain <- function(file_config, dtStart, dtEnd)
 # trailingOnly=TRUE means that only arguments after --args are returned
 # if trailingOnly=FALSE then you got:
 # [1] "--no-restore" "--no-save" "--args" "2010-01-28" "example" "100"
+################
+# debug
+################
+#test_debug <- function() {
 args <- commandArgs(trailingOnly=TRUE)
 
 if (length(args) == 0) {
     print("Invalid command. e.g. <prompt>command.bat param.xml [YYYYMMDD] [YYYYMMDD]")
-    quit(save="no", status=-1)
+#    quit(save="no", status=-1)
 } # if (length(args
 
 dtStart <- as.Date("1970-01-01")
-dtEnd <- as.Date("2099-12-31")
+dtEnd <- Sys.Date() - 1
 
 file_config <- args[1]
 
@@ -412,10 +415,15 @@ if (length(args) > 2) {
 
 rc <- qMain(file_config, dtStart, dtEnd)
 if (rc != 0) {
-    quit(save="no", status=rc)
+#    quit(save="no", status=rc)
 } # if (rc
 
-test_debug <- function()
+################
+# debug
+################
+#}
+
+test_debug2 <- function()
 {
     # tmp_dfData <- tmp_dfData %>%
     #                 group_by(id_yahoo) %>%
@@ -425,4 +433,36 @@ test_debug <- function()
 
     #dbWriteTable(dbconn, "tmp_test", tmp_df_all, overwrite=TRUE, temporary=FALSE)
     #save(list=c("tmp_df_all", "tmp_dfMaxDate"), envir=pos.to.env(1), file="test.RData")
+
+    file_config <- "_config_GetStockPrice_index.yml"
+    dtStart <- as.Date("1970-01-01")
+    dtEnd <- as.Date("2099-12-31")
+    rc <- qMain(file_config, dtStart, dtEnd)
+}
+
+old_get_max_date <- function(dbconn, start_date)
+{
+    if (missing(start_date)) start_date <- Sys.Date()
+    tmp_start_date <- as.numeric(as.POSIXct(start_date, tz="UTC"))
+    
+    tmp_sql <- "SELECT s1.sec_id, s1.id_yahoo, 
+                IFNULL(
+                    (SELECT MAX(a1.Date) FROM sec_return a1
+                        WHERE a1.sec_id = s1.sec_id
+                        AND a1.volume != 0
+                        AND a1.Date < (SELECT MAX(a2.Date) FROM sec_return a2
+                            WHERE a2.sec_id = a1.sec_id
+                            AND a2.volume != 0
+                            AND a2.Date < ?)), ?) AS [Date]
+            FROM securities s1
+            ORDER BY [sec_id]"
+    
+    tmp_sql <- str_replace_all(tmp_sql, "\\s+", " ")
+    
+    tmp_params <- as.list(rep(tmp_start_date, 2))
+    
+    tmp_df <- dbGetQuery(dbconn, tmp_sql, params=tmp_params)
+    tmp_df$Date <- as.Date.POSIXct(tmp_df$Date)
+    
+    return (tmp_df)
 }
