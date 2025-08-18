@@ -36,10 +36,10 @@ get_max_date <- function(dbconn)
                 IFNULL(
                     (SELECT MAX(a1.Date) FROM sec_return a1
                         WHERE a1.sec_id = s1.sec_id
-                        AND a1.volume != 0
+                        AND a1.volume IS NOT NULL
                         AND a1.Date < (SELECT MAX(a2.Date) FROM sec_return a2
                             WHERE a2.sec_id = a1.sec_id
-                            AND a2.volume != 0)), 0) AS [Date]
+                            AND a2.volume IS NOT NULL)), 0) AS [Date]
             FROM securities s1
             ORDER BY [sec_id]"
     
@@ -73,7 +73,7 @@ get_sec_return <- function(dbconn, sec_id, start_date, end_date)
     tmp_sql_1 <- "AND [Date] >= IFNULL(
             (SELECT MAX(r2.Date) FROM sec_return r2
             WHERE r2.sec_id = r1.sec_id
-            AND r2.volume != 0
+            AND r2.volume IS NOT NULL 
             AND r2.Date < ?), 0)"
     tmp_sql_2 <- "AND [Date] <= ?"
 
@@ -152,9 +152,12 @@ qdb_table_update <- function(dbconn, tmp_dfData, table_name, keys)
     rc <- table_update(dbconn, target_tbl, source_tbl)
 }
 
-qdb_sec_price_update <- function(dbconn, sec_id)
+qdb_sec_price_update <- function(dbconn, sec_id, start_date)
 {
     if (missing(sec_id)) sec_id <- NULL
+    if (missing(start_date)) start_date <- as.Date("1970-01-01")
+
+    cat(sprintf("\tUpdate table sec_price for sec_id = %s from '%s'\n", sec_id, start_date))
 
     tmp_var_price <- c("open", "high", "low", "close", "adj_close")
     tmp_var_volume <- c("volume")
@@ -164,6 +167,7 @@ qdb_sec_price_update <- function(dbconn, sec_id)
     tmp_dfV_last <- get_last_volume(dbconn, sec_id)
 
     tmp_dfPV <- tmp_dfPV_chg %>%
+        filter(Date >= start_date) %>%
         left_join(tmp_dfP_last, by=c("sec_id", "Date"), suffix=c("", "_last")) %>%
         left_join(tmp_dfV_last, by=c("sec_id", "Date"), suffix=c("", "_last")) %>%
         group_by(sec_id) %>%
@@ -347,6 +351,31 @@ qMain <- function(file_config, dtStart, dtEnd)
         inner_join(tmp_dfV_max_date, by=c("sec_id", "Date")) %>%
         select(sec_id, Date, any_of(tmp_var_volume))
 
+    # new (begin)
+    tmp_dfP_last_in_db <- get_last_price(dbconn)
+
+    # Those close price & adjusted close price difference <= 0.0001
+    # Don't update their full history
+    tmp_dfP_to_update <- tmp_dfP %>%
+                inner_join(tmp_dfP_last_in_db, by=c("sec_id", "Date"), 
+                    suffix=c("_new", "")) %>%
+                filter(abs(close_new - close) <= 0.0001 & 
+                    abs(adj_close_new - adj_close) <= 0.0001) %>%
+                select(sec_id, Date)
+
+    tmp_dfP_to_update_2 <- tmp_dfP %>%
+                distinct(sec_id) %>%
+                select(sec_id) %>%
+                filter(!(sec_id %in% tmp_dfP_to_update$sec_id)) %>%
+                mutate(Date=tmp_start_date_default)
+
+    if (nrow(tmp_dfP_to_update_2) > 0) {
+        tmp_dfP_to_update <- tmp_dfP_to_update %>%
+            bind_rows(tmp_dfP_to_update_2) %>%
+            distinct(sec_id, .keep_all=TRUE)
+    }
+    # new (end)
+
     keys <- "sec_id"
     table_name <- "last_price"
     qdb_table_update(dbconn, tmp_dfP_last, table_name, keys)
@@ -359,17 +388,30 @@ qMain <- function(file_config, dtStart, dtEnd)
     table_name <- "sec_return"
     qdb_table_update(dbconn, tmp_dfPV_chg, table_name, keys)
 
-    tmp_sec_id <- get_sec_id(dbconn)
-    if (length(tmp_sec_id) > 0) {
-        for (sec_id in tmp_sec_id) {
-            rc <- qdb_sec_price_update(dbconn, sec_id=sec_id)
+    # tmp_sec_id <- get_sec_id(dbconn)
+    # if (length(tmp_sec_id) > 0) {
+    #     for (sec_id in tmp_sec_id) {
+    #         rc <- qdb_sec_price_update(dbconn, sec_id=sec_id)
+    #         if (rc == 0) {
+    #             cat(sprintf("\tUpdate sec_price for sec_id = %s\n", sec_id))
+    #         } else {
+    #             cat(sprintf("\tFail to update sec_price for sec_id = %s\n", sec_id))
+    #         }
+    #     } # for
+    # }
+
+    if (nrow(tmp_dfP_to_update) > 0) {
+        for (i in 1:nrow(tmp_dfP_to_update)) {
+            sec_id <- tmp_dfP_to_update$sec_id[i]
+            start_date <- tmp_dfP_to_update$Date[i]
+            rc <- qdb_sec_price_update(dbconn, sec_id, start_date)
             if (rc == 0) {
                 cat(sprintf("\tUpdate sec_price for sec_id = %s\n", sec_id))
             } else {
                 cat(sprintf("\tFail to update sec_price for sec_id = %s\n", sec_id))
             }
         } # for
-   }
+    } # if
 
     tryCatch(
         dbDisconnect(dbconn),
@@ -434,35 +476,8 @@ test_debug2 <- function()
     #dbWriteTable(dbconn, "tmp_test", tmp_df_all, overwrite=TRUE, temporary=FALSE)
     #save(list=c("tmp_df_all", "tmp_dfMaxDate"), envir=pos.to.env(1), file="test.RData")
 
-    file_config <- "_config_GetStockPrice_index.yml"
+    file_config <- "_config_GetStockPrice_hk_test.yml"
     dtStart <- as.Date("1970-01-01")
     dtEnd <- as.Date("2099-12-31")
     rc <- qMain(file_config, dtStart, dtEnd)
-}
-
-old_get_max_date <- function(dbconn, start_date)
-{
-    if (missing(start_date)) start_date <- Sys.Date()
-    tmp_start_date <- as.numeric(as.POSIXct(start_date, tz="UTC"))
-    
-    tmp_sql <- "SELECT s1.sec_id, s1.id_yahoo, 
-                IFNULL(
-                    (SELECT MAX(a1.Date) FROM sec_return a1
-                        WHERE a1.sec_id = s1.sec_id
-                        AND a1.volume != 0
-                        AND a1.Date < (SELECT MAX(a2.Date) FROM sec_return a2
-                            WHERE a2.sec_id = a1.sec_id
-                            AND a2.volume != 0
-                            AND a2.Date < ?)), ?) AS [Date]
-            FROM securities s1
-            ORDER BY [sec_id]"
-    
-    tmp_sql <- str_replace_all(tmp_sql, "\\s+", " ")
-    
-    tmp_params <- as.list(rep(tmp_start_date, 2))
-    
-    tmp_df <- dbGetQuery(dbconn, tmp_sql, params=tmp_params)
-    tmp_df$Date <- as.Date.POSIXct(tmp_df$Date)
-    
-    return (tmp_df)
 }
